@@ -19,6 +19,24 @@ mod extract;
 mod omp;
 #[path = "generic_omp_bash_cwd.rs"]
 mod omp_bash_cwd;
+
+/// Resolve the host's tool-level directory for an execution-owner preview.
+/// This is path observation only; the owner must still judge current policy.
+pub fn omp_bash_execution_directory(
+    payload: &serde_json::Value,
+    home_dir: Option<&str>,
+    session: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    match omp_bash_cwd::resolve(payload, home_dir, session) {
+        omp_bash_cwd::BashCwd::Session => Ok(session.map(str::to_owned)),
+        omp_bash_cwd::BashCwd::Within(path) | omp_bash_cwd::BashCwd::Outside(path) => {
+            Ok(Some(path))
+        }
+        omp_bash_cwd::BashCwd::Missing | omp_bash_cwd::BashCwd::Unresolved => {
+            Err("bash_working_directory_unavailable")
+        }
+    }
+}
 #[cfg(all(test, unix))]
 #[path = "generic_omp_bash_cwd_tests.rs"]
 mod omp_bash_cwd_tests;
@@ -26,10 +44,14 @@ mod omp_bash_cwd_tests;
 mod open_quote;
 #[path = "generic_pure_eval.rs"]
 mod pure_eval;
+#[path = "generic_read_note.rs"]
+mod read_note;
 #[path = "redirect_projection.rs"]
 mod redirect_projection;
 #[path = "generic_result.rs"]
 mod result;
+#[path = "venv_activation_projection.rs"]
+mod venv_activation_projection;
 #[path = "workspace_redirects.rs"]
 pub(crate) mod workspace_redirects;
 use command_rewrite::payload_with_command;
@@ -45,6 +67,14 @@ use super::evaluate_pre_tool_with_execution_context;
 use extract::extract_generic_signals;
 use result::{generic_action, generic_error_result, generic_result};
 use std::time::Instant;
+
+/// The command a virtualenv activation hands its verdict to, or `None` when
+/// the activation is not one the scan can read through. The pre-tool pass
+/// answers for the projected command, so a caller that routes that answer
+/// somewhere which plans the call again has to plan the same text.
+pub fn venv_activation_target(command: &str, context: super::PathContext<'_>) -> Option<String> {
+    venv_activation_projection::project(command, context)
+}
 
 /// Bounded caller-supplied context, never authenticated provider facts.
 pub struct UntrustedCommandContext {
@@ -169,11 +199,11 @@ pub fn evaluate_pre_tool_envelope_with_execution_context(
     context: super::PathContext<'_>,
     execution_environment: Option<&guard_contracts::GuardExecutionEnvironmentV1>,
 ) -> PreToolResultV1 {
-    let mut context = context;
-    let projected_payload;
+    let mut context =
+        super::PathContext::for_session(context.home_dir, context.cwd, execution_environment);
+    let (projected_payload, cline_payload);
     let mut payload = payload;
     let within;
-    let cline_payload;
     if harness == "cline" {
         if let Some(view) = cline_view::evaluated_view(payload) {
             cline_payload = view;
@@ -430,6 +460,42 @@ fn evaluate_envelope(
         })
     {
         return contained;
+    }
+    // Activating a virtualenv exports settings and runs nothing else, so the
+    // command after it carries the verdict, as an inert environment prefix
+    // does: the unprojected pass fails only on the `source` itself. A rule
+    // that gates the plain form keeps its fail-closed answer for this one.
+    if let Some(projected) = signals
+        .command
+        .as_deref()
+        .filter(|_| !search_scope_proven && !apply_patch_proven)
+        .and_then(|command| venv_activation_projection::project(command, context))
+    {
+        let projected_payload = payload_with_command(
+            payload,
+            signals.command.as_deref().unwrap_or_default(),
+            &projected,
+        );
+        if projected_payload != *payload {
+            let projected = evaluate_envelope(
+                harness,
+                event,
+                &projected_payload,
+                controls,
+                deadline,
+                context,
+                execution_environment,
+                project_redirects,
+            );
+            if projected.minimum_action == "allow"
+                || (projected.minimum_action == "sandbox-required"
+                    && crate::hook_responses::contained_execution_profile(&projected.reason_code)
+                        .is_some())
+                || !extension_rule_matched(&projected)
+            {
+                return projected;
+            }
+        }
     }
     // An inert environment prefix cannot change how the rest of the command
     // runs, so the command without it carries the whole verdict.
@@ -727,6 +793,8 @@ fn evaluate_envelope(
     if result.reason_code == "native_file_read_review" {
         if let Some(note) = omp::grep_review_note(payload, &signals, &omp_context) {
             result.reason = format!("{} {note}", result.reason);
+        } else if let Some(reason) = read_note::read_review_reason(&signals, &omp_context) {
+            result.reason = reason;
         }
     }
     if event == "UserPromptSubmit" {
@@ -817,7 +885,7 @@ fn evaluate_envelope(
             .unwrap_or_else(|| "HOL Guard requires review because this Git read may execute a configured helper, or its effective configuration could not be verified.".into());
     }
     let contained_test_reason = command_model.and_then(|model| {
-        super::restricted_tests::package_script::contained_test_reason(
+        super::restricted_test_commands::package_script::contained_test_reason(
             model,
             super::PathContext {
                 home_dir,
@@ -894,7 +962,7 @@ fn evaluate_envelope(
                     .permission_observations
                     .iter()
                     .all(|observation| {
-                        super::restricted_tests::package_permission_contained(
+                        super::restricted_test_commands::package_permission_contained(
                             contained_test_reason,
                             command_model,
                         ) && observation.extension_id == "command.package.node"
@@ -929,6 +997,19 @@ fn evaluate_envelope(
         )
         .into();
     }
+    // A proven fast-forward of origin runs directly, as the pull it splits
+    // does; the sandbox would cut the fetch beside it off the network.
+    super::git_remote_ops::settle_fast_forward(
+        &mut result,
+        command_model,
+        super::PathContext {
+            home_dir,
+            cwd,
+            ..context
+        },
+        deadline,
+        execution_environment,
+    );
     super::workspace_contained::convert(
         &mut result,
         &pre_floor,
